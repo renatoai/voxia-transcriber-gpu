@@ -148,30 +148,42 @@ def assign_speakers(words: list, diarize_result) -> list:
                 w["speaker_id"] = "speaker_0"
         return words
 
-    # Support both pyannote 3.x (.itertracks) and 4.x (.itertracks or dict-like)
+    # Extract speaker turns from diarization result
     turns = []
-    try:
-        for turn, _, speaker in diarize_result.itertracks(yield_label=True):
-            turns.append((turn.start, turn.end, speaker))
-    except AttributeError:
-        # pyannote 4.x DiarizeOutput — iterate as annotation
+    logger.info(f"Diarize result type: {type(diarize_result).__name__}")
+    logger.info(f"Diarize result attrs: {[a for a in dir(diarize_result) if not a.startswith('_')]}")
+
+    # Try multiple ways to extract turns
+    annotation = None
+
+    # 1. Direct itertracks (pyannote 3.x Annotation)
+    if hasattr(diarize_result, 'itertracks'):
+        annotation = diarize_result
+    # 2. DiarizeOutput with .output or .annotation attribute
+    elif hasattr(diarize_result, 'output'):
+        annotation = diarize_result.output
+    elif hasattr(diarize_result, 'annotation'):
+        annotation = diarize_result.annotation
+    # 3. Dict-like access
+    elif isinstance(diarize_result, dict):
+        annotation = diarize_result.get('annotation') or diarize_result.get('output')
+    # 4. Indexed access (named tuple)
+    else:
         try:
-            annotation = diarize_result.annotation if hasattr(diarize_result, 'annotation') else diarize_result
-            for turn, _, speaker in annotation.itertracks(yield_label=True):
-                turns.append((turn.start, turn.end, speaker))
-        except Exception:
-            # Last resort: try to access as pandas DataFrame
-            try:
-                df = diarize_result.to_df() if hasattr(diarize_result, 'to_df') else None
-                if df is not None:
-                    for _, row in df.iterrows():
-                        turns.append((row['start'], row['end'], row['speaker']))
-            except Exception:
-                logger.warning("Could not parse diarization output, defaulting all to speaker_0")
-                for w in words:
-                    if w["type"] == "word":
-                        w["speaker_id"] = "speaker_0"
-                return words
+            annotation = diarize_result[0] if len(diarize_result) > 0 else None
+        except (TypeError, KeyError):
+            pass
+
+    if annotation is not None and hasattr(annotation, 'itertracks'):
+        for turn, _, speaker in annotation.itertracks(yield_label=True):
+            turns.append((turn.start, turn.end, speaker))
+        logger.info(f"Extracted {len(turns)} turns from annotation")
+    else:
+        logger.warning(f"Could not extract annotation. annotation type: {type(annotation).__name__ if annotation else 'None'}")
+        for w in words:
+            if w["type"] == "word":
+                w["speaker_id"] = "speaker_0"
+        return words
 
     if not turns:
         for w in words:
