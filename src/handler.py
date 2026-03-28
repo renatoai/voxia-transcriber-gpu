@@ -159,20 +159,18 @@ def assign_speakers(words: list, diarize_result) -> list:
     # 1. Direct itertracks (pyannote 3.x Annotation)
     if hasattr(diarize_result, 'itertracks'):
         annotation = diarize_result
-    # 2. DiarizeOutput with .output or .annotation attribute
+    # 2. pyannote 4.x DiarizeOutput — use speaker_diarization attribute
+    elif hasattr(diarize_result, 'speaker_diarization'):
+        annotation = diarize_result.speaker_diarization
+        logger.info(f"Using speaker_diarization attr, type: {type(annotation).__name__}")
+    # 3. DiarizeOutput with .output or .annotation attribute
     elif hasattr(diarize_result, 'output'):
         annotation = diarize_result.output
     elif hasattr(diarize_result, 'annotation'):
         annotation = diarize_result.annotation
-    # 3. Dict-like access
-    elif isinstance(diarize_result, dict):
-        annotation = diarize_result.get('annotation') or diarize_result.get('output')
-    # 4. Indexed access (named tuple)
-    else:
-        try:
-            annotation = diarize_result[0] if len(diarize_result) > 0 else None
-        except (TypeError, KeyError):
-            pass
+    # 4. exclusive_speaker_diarization
+    elif hasattr(diarize_result, 'exclusive_speaker_diarization'):
+        annotation = diarize_result.exclusive_speaker_diarization
 
     if annotation is not None and hasattr(annotation, 'itertracks'):
         for turn, _, speaker in annotation.itertracks(yield_label=True):
