@@ -1,4 +1,4 @@
-FROM pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime
+FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
@@ -6,18 +6,19 @@ ENV HF_HOME=/root/.cache/huggingface
 
 # System deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg \
-    git \
+    python3.11 python3.11-venv python3-pip \
+    ffmpeg git \
+    && ln -sf /usr/bin/python3.11 /usr/bin/python \
     && rm -rf /var/lib/apt/lists/*
 
-# Remove pre-installed torchvision/torchaudio to avoid conflicts
-RUN pip uninstall -y torchvision torchaudio torchmetrics 2>/dev/null; true
-
-# Install matching versions
+# Install PyTorch + audio + vision (matching versions, CUDA 12.4)
 RUN pip install --no-cache-dir \
+    torch==2.6.0 \
     torchaudio==2.6.0 \
-    torchvision==0.21.0
+    torchvision==0.21.0 \
+    --index-url https://download.pytorch.org/whl/cu124
 
+# Install whisperx, pyannote, runpod
 RUN pip install --no-cache-dir \
     whisperx \
     "pyannote.audio>=4.0" \
