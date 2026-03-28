@@ -148,9 +148,36 @@ def assign_speakers(words: list, diarize_result) -> list:
                 w["speaker_id"] = "speaker_0"
         return words
 
+    # Support both pyannote 3.x (.itertracks) and 4.x (.itertracks or dict-like)
     turns = []
-    for turn, _, speaker in diarize_result.itertracks(yield_label=True):
-        turns.append((turn.start, turn.end, speaker))
+    try:
+        for turn, _, speaker in diarize_result.itertracks(yield_label=True):
+            turns.append((turn.start, turn.end, speaker))
+    except AttributeError:
+        # pyannote 4.x DiarizeOutput — iterate as annotation
+        try:
+            annotation = diarize_result.annotation if hasattr(diarize_result, 'annotation') else diarize_result
+            for turn, _, speaker in annotation.itertracks(yield_label=True):
+                turns.append((turn.start, turn.end, speaker))
+        except Exception:
+            # Last resort: try to access as pandas DataFrame
+            try:
+                df = diarize_result.to_df() if hasattr(diarize_result, 'to_df') else None
+                if df is not None:
+                    for _, row in df.iterrows():
+                        turns.append((row['start'], row['end'], row['speaker']))
+            except Exception:
+                logger.warning("Could not parse diarization output, defaulting all to speaker_0")
+                for w in words:
+                    if w["type"] == "word":
+                        w["speaker_id"] = "speaker_0"
+                return words
+
+    if not turns:
+        for w in words:
+            if w["type"] == "word":
+                w["speaker_id"] = "speaker_0"
+        return words
 
     unique_speakers = []
     for _, _, spk in turns:
