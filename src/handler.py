@@ -142,7 +142,7 @@ def diarize_audio(audio_path: str):
 
 
 def assign_speakers(words: list, diarize_result) -> list:
-    if diarize_result is None or len(diarize_result) == 0:
+    if diarize_result is None:
         for w in words:
             if w["type"] == "word":
                 w["speaker_id"] = "speaker_0"
