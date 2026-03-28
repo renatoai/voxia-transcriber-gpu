@@ -10,7 +10,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     && rm -rf /var/lib/apt/lists/*
 
-# Python deps — order matters for compatibility
+# Remove pre-installed torchvision/torchaudio to avoid conflicts
+RUN pip uninstall -y torchvision torchaudio torchmetrics 2>/dev/null; true
+
+# Install matching versions
 RUN pip install --no-cache-dir \
     torchaudio==2.6.0 \
     torchvision==0.21.0
