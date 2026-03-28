@@ -88,15 +88,20 @@ def download_audio(url: str) -> str:
     return tmp.name
 
 
-def transcribe_audio(audio_path: str, language: str = "pt"):
+def transcribe_and_diarize(audio_path: str, language: str = "pt", should_diarize: bool = True):
+    """Transcribe + align + diarize in one function using WhisperX native pipeline."""
+    import pandas as pd
+
     audio = whisperx.load_audio(audio_path)
 
+    # 1. Transcribe
     result = whisper_model.transcribe(
         audio,
         language=language,
         batch_size=WHISPER_BATCH_SIZE,
     )
 
+    # 2. Align
     result = whisperx.align(
         result["segments"],
         align_model,
@@ -106,122 +111,80 @@ def transcribe_audio(audio_path: str, language: str = "pt"):
         return_char_alignments=False,
     )
 
+    # 3. Diarize + assign speakers using WhisperX native method
+    if should_diarize and diarize_pipeline is not None:
+        logger.info("Running diarization...")
+        t0 = time.time()
+
+        waveform, sample_rate = torchaudio.load(audio_path)
+        if waveform.shape[0] > 1:
+            waveform = waveform.mean(dim=0, keepdim=True)
+        diarize_result = diarize_pipeline({"waveform": waveform, "sample_rate": sample_rate})
+
+        # Extract annotation from pyannote 4.x DiarizeOutput
+        annotation = None
+        if hasattr(diarize_result, 'itertracks'):
+            annotation = diarize_result
+        elif hasattr(diarize_result, 'speaker_diarization'):
+            annotation = diarize_result.speaker_diarization
+
+        if annotation is not None and hasattr(annotation, 'itertracks'):
+            # Convert to DataFrame for whisperx.assign_word_speakers
+            turns = []
+            for turn, _, speaker in annotation.itertracks(yield_label=True):
+                turns.append({"start": turn.start, "end": turn.end, "speaker": speaker})
+
+            if turns:
+                diarize_df = pd.DataFrame(turns)
+                logger.info(f"Diarization done in {time.time() - t0:.1f}s — {len(turns)} turns")
+
+                # Use WhisperX native speaker assignment
+                result = whisperx.assign_word_speakers(diarize_df, result)
+            else:
+                logger.warning("No diarization turns found")
+        else:
+            logger.warning(f"Could not extract annotation from {type(diarize_result).__name__}")
+
+    # 4. Convert to ElevenLabs Scribe format
     words = []
     full_text_parts = []
+
+    # Map pyannote speaker labels to speaker_0, speaker_1, etc.
+    speaker_map = {}
+    speaker_idx = 0
 
     for segment in result.get("segments", []):
         text = segment.get("text", "").strip()
         if text:
             full_text_parts.append(text)
+
+        seg_speaker = segment.get("speaker", "SPEAKER_00")
+
         for w in segment.get("words", []):
+            # Get speaker from word level or segment level
+            w_speaker = w.get("speaker", seg_speaker)
+            if w_speaker not in speaker_map:
+                speaker_map[w_speaker] = f"speaker_{speaker_idx}"
+                speaker_idx += 1
+
             words.append({
                 "text": " " + w.get("word", w.get("text", "")),
                 "start": round(w.get("start", 0), 3),
                 "end": round(w.get("end", 0), 3),
                 "type": "word",
-                "speaker_id": None,
+                "speaker_id": speaker_map.get(w_speaker, "speaker_0"),
             })
             words.append({
                 "text": " ", "start": None, "end": None,
-                "type": "spacing", "speaker_id": None,
+                "type": "spacing", "speaker_id": speaker_map.get(w_speaker, "speaker_0"),
             })
 
     if words and words[-1]["type"] == "spacing":
         words.pop()
 
+    logger.info(f"Speakers found: {speaker_map}")
+
     return " ".join(full_text_parts), words, language
-
-
-def diarize_audio(audio_path: str):
-    if diarize_pipeline is None:
-        return None
-    waveform, sample_rate = torchaudio.load(audio_path)
-    if waveform.shape[0] > 1:
-        waveform = waveform.mean(dim=0, keepdim=True)
-    return diarize_pipeline({"waveform": waveform, "sample_rate": sample_rate})
-
-
-def assign_speakers(words: list, diarize_result) -> list:
-    if diarize_result is None:
-        for w in words:
-            if w["type"] == "word":
-                w["speaker_id"] = "speaker_0"
-        return words
-
-    # Extract speaker turns from diarization result
-    turns = []
-    logger.info(f"Diarize result type: {type(diarize_result).__name__}")
-    logger.info(f"Diarize result attrs: {[a for a in dir(diarize_result) if not a.startswith('_')]}")
-
-    # Try multiple ways to extract turns
-    annotation = None
-
-    # 1. Direct itertracks (pyannote 3.x Annotation)
-    if hasattr(diarize_result, 'itertracks'):
-        annotation = diarize_result
-    # 2. pyannote 4.x DiarizeOutput — use speaker_diarization attribute
-    elif hasattr(diarize_result, 'speaker_diarization'):
-        annotation = diarize_result.speaker_diarization
-        logger.info(f"Using speaker_diarization attr, type: {type(annotation).__name__}")
-    # 3. DiarizeOutput with .output or .annotation attribute
-    elif hasattr(diarize_result, 'output'):
-        annotation = diarize_result.output
-    elif hasattr(diarize_result, 'annotation'):
-        annotation = diarize_result.annotation
-    # 4. exclusive_speaker_diarization
-    elif hasattr(diarize_result, 'exclusive_speaker_diarization'):
-        annotation = diarize_result.exclusive_speaker_diarization
-
-    if annotation is not None and hasattr(annotation, 'itertracks'):
-        for turn, _, speaker in annotation.itertracks(yield_label=True):
-            turns.append((turn.start, turn.end, speaker))
-        logger.info(f"Extracted {len(turns)} turns from annotation")
-    else:
-        logger.warning(f"Could not extract annotation. annotation type: {type(annotation).__name__ if annotation else 'None'}")
-        for w in words:
-            if w["type"] == "word":
-                w["speaker_id"] = "speaker_0"
-        return words
-
-    if not turns:
-        for w in words:
-            if w["type"] == "word":
-                w["speaker_id"] = "speaker_0"
-        return words
-
-    unique_speakers = []
-    for _, _, spk in turns:
-        if spk not in unique_speakers:
-            unique_speakers.append(spk)
-
-    for w in words:
-        if w["type"] != "word" or w["start"] is None:
-            continue
-        word_mid = (w["start"] + w["end"]) / 2
-        best_speaker = None
-        best_overlap = 0
-        for turn_start, turn_end, speaker in turns:
-            overlap = max(0, min(w["end"], turn_end) - max(w["start"], turn_start))
-            if overlap > best_overlap:
-                best_overlap = overlap
-                best_speaker = speaker
-        if best_speaker is None:
-            min_dist = float("inf")
-            for turn_start, turn_end, speaker in turns:
-                dist = min(abs(word_mid - turn_start), abs(word_mid - turn_end))
-                if dist < min_dist:
-                    min_dist = dist
-                    best_speaker = speaker
-        if best_speaker:
-            w["speaker_id"] = f"speaker_{unique_speakers.index(best_speaker)}"
-        else:
-            w["speaker_id"] = "speaker_0"
-
-    for i, w in enumerate(words):
-        if w["type"] == "spacing" and i > 0 and words[i - 1].get("speaker_id"):
-            w["speaker_id"] = words[i - 1]["speaker_id"]
-
-    return words
 
 
 # ---------------------------------------------------------------------------
@@ -269,23 +232,9 @@ def handler(event):
             tmp.close()
             audio_path = tmp.name
 
-        # Transcribe
-        logger.info(f"Transcribing: {filename}")
-        t0 = time.time()
-        full_text, words, lang = transcribe_audio(audio_path, language)
-        logger.info(f"Transcription: {time.time() - t0:.1f}s — {len(words)} words")
-
-        # Diarize
-        if should_diarize and diarize_pipeline is not None:
-            logger.info("Diarizing...")
-            t0 = time.time()
-            dr = diarize_audio(audio_path)
-            logger.info(f"Diarization: {time.time() - t0:.1f}s")
-            words = assign_speakers(words, dr)
-        else:
-            for w in words:
-                if w["type"] == "word":
-                    w["speaker_id"] = "speaker_0"
+        # Transcribe + diarize (unified pipeline)
+        logger.info(f"Processing: {filename}")
+        full_text, words, lang = transcribe_and_diarize(audio_path, language, should_diarize)
 
         elapsed = time.time() - t_total
         logger.info(f"Total: {elapsed:.1f}s for {filename}")
