@@ -29,7 +29,7 @@ RUN pip install --no-cache-dir "torchmetrics<1.6.0"
 
 # Pin whisperx + pyannote + runpod
 RUN pip install --no-cache-dir \
-    "whisperx==3.3.1" \
+    "whisperx==3.8.1" \
     "pyannote.audio>=4.0" \
     runpod \
     requests \
