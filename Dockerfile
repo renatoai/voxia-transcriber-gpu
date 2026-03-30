@@ -1,4 +1,4 @@
-FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
+FROM nvidia/cuda:12.8.0-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
@@ -20,9 +20,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # PyTorch + torchaudio ONLY (no torchvision — not needed)
 RUN pip install --no-cache-dir \
-    torch==2.6.0+cu124 \
-    torchaudio==2.6.0+cu124 \
-    --index-url https://download.pytorch.org/whl/cu124
+    torch==2.8.0 \
+    torchaudio==2.8.0 \
+    --extra-index-url https://download.pytorch.org/whl/cu128
 
 # Pin torchmetrics before 1.6 to avoid circular import
 RUN pip install --no-cache-dir "torchmetrics<1.6.0"
