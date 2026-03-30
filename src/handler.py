@@ -1,6 +1,6 @@
 """
 VoxiaHub Transcription — RunPod Serverless Handler
-WhisperX (large-v3) + Pyannote diarization on GPU.
+WhisperX (large-v3) + WhisperX DiarizationPipeline on GPU.
 Output compatible with ElevenLabs Scribe API.
 """
 
@@ -9,12 +9,11 @@ import time
 import base64
 import tempfile
 import logging
+import gc
 
 import torch
-import torchaudio
 import whisperx
 import requests as http_requests
-from pyannote.audio import Pipeline as PyannotePipeline
 
 import runpod
 
@@ -55,16 +54,18 @@ align_model, align_metadata = whisperx.load_align_model(
 )
 logger.info(f"Alignment loaded in {time.time() - t0:.1f}s")
 
-diarize_pipeline = None
+# Use WhisperX's own DiarizationPipeline wrapper (not raw pyannote)
+diarize_model = None
 if HF_TOKEN:
-    logger.info("Loading Pyannote diarization...")
+    logger.info("Loading WhisperX DiarizationPipeline...")
     t0 = time.time()
-    diarize_pipeline = PyannotePipeline.from_pretrained(
-        "pyannote/speaker-diarization-3.1",
+    from whisperx.diarize import DiarizationPipeline
+    diarize_model = DiarizationPipeline(
+        model_name="pyannote/speaker-diarization-3.1",
         token=HF_TOKEN,
+        device=DEVICE,
     )
-    diarize_pipeline.to(torch.device(DEVICE))
-    logger.info(f"Pyannote loaded in {time.time() - t0:.1f}s")
+    logger.info(f"Diarization pipeline loaded in {time.time() - t0:.1f}s")
 else:
     logger.warning("HF_TOKEN not set — diarization disabled.")
 
@@ -88,9 +89,11 @@ def download_audio(url: str) -> str:
     return tmp.name
 
 
-def transcribe_and_diarize(audio_path: str, language: str = "pt", should_diarize: bool = True):
-    """Transcribe + align + diarize in one function using WhisperX native pipeline."""
-    import pandas as pd
+def transcribe_and_diarize(audio_path: str, language: str = "pt",
+                           should_diarize: bool = True,
+                           min_speakers: int = None,
+                           max_speakers: int = None):
+    """Transcribe + align + diarize using WhisperX native pipeline."""
 
     audio = whisperx.load_audio(audio_path)
 
@@ -111,45 +114,29 @@ def transcribe_and_diarize(audio_path: str, language: str = "pt", should_diarize
         return_char_alignments=False,
     )
 
-    # 3. Diarize + assign speakers using WhisperX native method
-    if should_diarize and diarize_pipeline is not None:
-        logger.info("Running diarization...")
+    # 3. Diarize using WhisperX DiarizationPipeline (returns proper DataFrame)
+    if should_diarize and diarize_model is not None:
+        logger.info(f"Running diarization (min_speakers={min_speakers}, max_speakers={max_speakers})...")
         t0 = time.time()
 
-        waveform, sample_rate = torchaudio.load(audio_path)
-        if waveform.shape[0] > 1:
-            waveform = waveform.mean(dim=0, keepdim=True)
-        diarize_result = diarize_pipeline({"waveform": waveform, "sample_rate": sample_rate})
+        diarize_segments = diarize_model(
+            audio,
+            min_speakers=min_speakers,
+            max_speakers=max_speakers,
+        )
 
-        # Extract annotation from pyannote 4.x DiarizeOutput
-        annotation = None
-        if hasattr(diarize_result, 'itertracks'):
-            annotation = diarize_result
-        elif hasattr(diarize_result, 'speaker_diarization'):
-            annotation = diarize_result.speaker_diarization
+        result = whisperx.assign_word_speakers(diarize_segments, result)
+        logger.info(f"Diarization done in {time.time() - t0:.1f}s")
 
-        if annotation is not None and hasattr(annotation, 'itertracks'):
-            # Convert to DataFrame for whisperx.assign_word_speakers
-            turns = []
-            for turn, _, speaker in annotation.itertracks(yield_label=True):
-                turns.append({"start": turn.start, "end": turn.end, "speaker": speaker})
-
-            if turns:
-                diarize_df = pd.DataFrame(turns)
-                logger.info(f"Diarization done in {time.time() - t0:.1f}s — {len(turns)} turns")
-
-                # Use WhisperX native speaker assignment
-                result = whisperx.assign_word_speakers(diarize_df, result)
-            else:
-                logger.warning("No diarization turns found")
-        else:
-            logger.warning(f"Could not extract annotation from {type(diarize_result).__name__}")
+        # Free GPU memory
+        gc.collect()
+        torch.cuda.empty_cache()
 
     # 4. Convert to ElevenLabs Scribe format
     words = []
     full_text_parts = []
 
-    # Map pyannote speaker labels to speaker_0, speaker_1, etc.
+    # Map speaker labels to speaker_0, speaker_1, etc.
     speaker_map = {}
     speaker_idx = 0
 
@@ -161,7 +148,6 @@ def transcribe_and_diarize(audio_path: str, language: str = "pt", should_diarize
         seg_speaker = segment.get("speaker", "SPEAKER_00")
 
         for w in segment.get("words", []):
-            # Get speaker from word level or segment level
             w_speaker = w.get("speaker", seg_speaker)
             if w_speaker not in speaker_map:
                 speaker_map[w_speaker] = f"speaker_{speaker_idx}"
@@ -169,8 +155,8 @@ def transcribe_and_diarize(audio_path: str, language: str = "pt", should_diarize
 
             words.append({
                 "text": " " + w.get("word", w.get("text", "")),
-                "start": round(w.get("start", 0), 3),
-                "end": round(w.get("end", 0), 3),
+                "start": round(w.get("start", 0), 3) if w.get("start") is not None else None,
+                "end": round(w.get("end", 0), 3) if w.get("end") is not None else None,
                 "type": "word",
                 "speaker_id": speaker_map.get(w_speaker, "speaker_0"),
             })
@@ -197,6 +183,8 @@ def handler(event):
         audio_base64: str    — OR base64-encoded audio
         language: str        — default "pt"
         diarize: bool        — default true
+        min_speakers: int    — optional, hint for diarization
+        max_speakers: int    — optional, hint for diarization
         filename: str        — optional, for logging
 
     Output (ElevenLabs Scribe compatible):
@@ -211,6 +199,8 @@ def handler(event):
     audio_b64 = input_data.get("audio_base64")
     language = input_data.get("language", "pt")
     should_diarize = input_data.get("diarize", True)
+    min_speakers = input_data.get("min_speakers", 2)
+    max_speakers = input_data.get("max_speakers", None)
     filename = input_data.get("filename", "audio.mp3")
 
     if not audio_url and not audio_b64:
@@ -232,9 +222,13 @@ def handler(event):
             tmp.close()
             audio_path = tmp.name
 
-        # Transcribe + diarize (unified pipeline)
+        # Transcribe + diarize
         logger.info(f"Processing: {filename}")
-        full_text, words, lang = transcribe_and_diarize(audio_path, language, should_diarize)
+        full_text, words, lang = transcribe_and_diarize(
+            audio_path, language, should_diarize,
+            min_speakers=min_speakers,
+            max_speakers=max_speakers,
+        )
 
         elapsed = time.time() - t_total
         logger.info(f"Total: {elapsed:.1f}s for {filename}")
@@ -248,7 +242,7 @@ def handler(event):
         }
 
     except Exception as e:
-        logger.error(f"Failed: {e}")
+        logger.error(f"Failed: {e}", exc_info=True)
         return {"error": str(e)}
 
     finally:
